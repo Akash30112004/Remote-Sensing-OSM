@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS osm_industries (
     id BIGSERIAL PRIMARY KEY,
     osm_id BIGINT NOT NULL,
     osm_type TEXT NOT NULL,
+    osm_version INTEGER,
+    osm_changeset BIGINT,
     name TEXT,
     normalized_name TEXT,
     industrial_type TEXT,
@@ -64,6 +66,24 @@ CREATE TABLE IF NOT EXISTS osm_industries (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT osm_industries_source_key UNIQUE (source, osm_type, osm_id)
 );
+
+-- Idempotent migration: add osm_version / osm_changeset to existing databases
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'osm_industries' AND column_name = 'osm_version'
+    ) THEN
+        ALTER TABLE osm_industries ADD COLUMN osm_version INTEGER;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'osm_industries' AND column_name = 'osm_changeset'
+    ) THEN
+        ALTER TABLE osm_industries ADD COLUMN osm_changeset BIGINT;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS industrial_entity_matches (
     id BIGSERIAL PRIMARY KEY,
@@ -122,6 +142,18 @@ CREATE TABLE IF NOT EXISTS industrial_sites (
     CONSTRAINT industrial_sites_site_id_key UNIQUE (site_id)
 );
 
+-- Idempotent migration: add normalized_industry_type to existing databases
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'industrial_sites' AND column_name = 'normalized_industry_type'
+    ) THEN
+        ALTER TABLE industrial_sites ADD COLUMN normalized_industry_type TEXT;
+    END IF;
+END
+$$;
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -163,3 +195,25 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- site_source_records — stable source identity ledger (Phase 9)
+-- Each row maps one (site_id, source_system, source_key) pair.
+-- This table is the ground truth for refresh-aware site resolution:
+-- on re-run, existing site_ids are looked up here instead of being
+-- regenerated, preventing foreign key drift.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS site_source_records (
+    id              BIGSERIAL PRIMARY KEY,
+    site_id         TEXT NOT NULL,
+    source_system   TEXT NOT NULL,
+    source_key      TEXT NOT NULL,
+    source_id       TEXT NOT NULL,
+    source_table    TEXT NOT NULL,
+    source_version  TEXT,
+    first_linked    DATE NOT NULL,
+    last_linked     DATE NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT site_source_records_unique UNIQUE (site_id, source_system, source_key)
+);

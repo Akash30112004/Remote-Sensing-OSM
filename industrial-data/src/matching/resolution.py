@@ -20,6 +20,12 @@ from src.temporal import current_extraction_date
 from .config import MatchingSourceConfig, MatchingThresholdConfig, MatchingWeightConfig
 
 
+# Lazy import to avoid circular dependency at module load time
+def _get_blocking_module():
+    from src.matching.blocking import BlockingConfig, generate_blocked_candidates
+    return BlockingConfig, generate_blocked_candidates
+
+
 @dataclass(frozen=True)
 class IndustrialRecord:
     source_type: str
@@ -103,6 +109,30 @@ def _text_similarity(left: str | None, right: str | None) -> float:
     if not left or not right:
         return 0.0
     return fuzz.token_set_ratio(left, right) / 100.0
+
+
+_GENERIC_INDUSTRIAL_TYPES = {
+    "industrial",
+    "building industrial",
+    "landuse industrial",
+    "factory",
+    "works",
+    "plant",
+    "manufacturing",
+    "industry",
+    "industrial estate",
+    "industrial area",
+    "general industries",
+    "general",
+    "unit",
+}
+
+
+def _is_generic_industrial(text: str | None) -> bool:
+    if not text:
+        return False
+    cleaned = text.strip().lower()
+    return cleaned in _GENERIC_INDUSTRIAL_TYPES
 
 
 def _distance_meters(left_geometry: BaseGeometry, right_geometry: BaseGeometry, metric_crs: CRS) -> float:
@@ -208,83 +238,164 @@ def generate_candidate_matches(
     source_config: MatchingSourceConfig,
     weight_config: MatchingWeightConfig,
     threshold_config: MatchingThresholdConfig,
+    *,
+    blocking_strategies: list[str] | None = None,
+    max_candidates_per_osm: int | None = 50,
 ) -> list[CandidateMatch]:
+    """Generate candidate matches using blocking for scalability.
+
+    Matching pipeline:
+      OSM Record
+        ↓ Blocking (district / spatial_radius / grid / name_prefix / industry)
+        ↓ Small candidate set  (vs original O(N×M))
+        ↓ Spatial score
+        ↓ Name similarity (RapidFuzz token_set_ratio)
+        ↓ Address score
+        ↓ Industry score
+        ↓ Weighted match_score
+        ↓ Confidence classification + review_required
+
+    Parameters
+    ----------
+    osm_records, government_records : list[IndustrialRecord]
+    source_config : MatchingSourceConfig
+    weight_config : MatchingWeightConfig
+    threshold_config : MatchingThresholdConfig
+    blocking_strategies : list[str] | None
+        Override the default blocking strategies.
+        Default: ["spatial_radius", "district"]
+    max_candidates_per_osm : int | None
+        Maximum candidates per OSM record.  None = no cap.
+
+    Returns
+    -------
+    list[CandidateMatch]
+    """
     if not osm_records or not government_records:
         return []
 
-    geometry_series = gpd.GeoSeries([record.geometry for record in [*osm_records, *government_records] if record.geometry is not None], crs="EPSG:4326")
-    metric_crs = geometry_series.estimate_utm_crs() or CRS.from_epsg(3857)
+    BlockingConfig, generate_blocked_candidates = _get_blocking_module()
 
+    strategies = blocking_strategies or ["spatial_radius"]
+    blocking_config = BlockingConfig(
+        strategies=strategies,
+        max_spatial_distance_meters=source_config.max_spatial_distance_meters,
+        min_strategies=1,
+        max_candidates_per_osm=max_candidates_per_osm,
+    )
+
+    candidate_pairs, blocking_stats = generate_blocked_candidates(
+        osm_records, government_records, blocking_config
+    )
+
+    if not candidate_pairs:
+        return []
+
+    # Compute metric CRS once for all pairs
+    sample_geoms = [
+        r.geometry for r in osm_records[:5] + government_records[:5]
+        if r.geometry is not None
+    ]
+    if sample_geoms:
+        geo_series = gpd.GeoSeries(sample_geoms, crs="EPSG:4326")
+        metric_crs = geo_series.estimate_utm_crs() or CRS.from_epsg(3857)
+    else:
+        metric_crs = CRS.from_epsg(3857)
+
+    blocking_tag = "+".join(sorted(set(strategies)))
     candidates: list[CandidateMatch] = []
 
-    for osm_record in osm_records:
-        for government_record in government_records:
-            state_consistent, district_consistent = _shared_state_district(
-                osm_record.state,
-                government_record.state,
-                osm_record.district,
-                government_record.district,
+    for osm_record, government_record in candidate_pairs:
+        state_consistent, district_consistent = _shared_state_district(
+            osm_record.state,
+            government_record.state,
+            osm_record.district,
+            government_record.district,
+        )
+        if source_config.require_state_district_consistency and (not state_consistent or not district_consistent):
+            continue
+
+        distance_meters = _distance_meters(osm_record.geometry, government_record.geometry, metric_crs)
+        name_score = _text_similarity(osm_record.normalized_name, government_record.normalized_name)
+        address_score = _text_similarity(osm_record.normalized_address, government_record.normalized_address)
+        industry_score = _text_similarity(osm_record.normalized_industry_type, government_record.normalized_industry_type)
+
+        # Handle generic industrial terminology (e.g. building=industrial vs Factory)
+        if industry_score < 0.5 and osm_record.normalized_industry_type and government_record.normalized_industry_type:
+            if _is_generic_industrial(osm_record.normalized_industry_type) and _is_generic_industrial(government_record.normalized_industry_type):
+                industry_score = 1.0
+
+        candidate_reasons = []
+        if distance_meters <= source_config.max_spatial_distance_meters:
+            candidate_reasons.append("spatial")
+        if name_score >= (source_config.candidate_name_similarity_min / 100.0):
+            candidate_reasons.append("name")
+        if address_score >= (source_config.candidate_address_similarity_min / 100.0):
+            candidate_reasons.append("address")
+        if industry_score >= (source_config.candidate_industry_similarity_min / 100.0):
+            candidate_reasons.append("industry")
+
+        if not candidate_reasons:
+            continue
+
+        spatial_score = 0.0
+        if source_config.max_spatial_distance_meters > 0:
+            spatial_score = max(0.0, 1.0 - min(distance_meters / source_config.max_spatial_distance_meters, 1.0))
+
+        # Dynamically normalize weights over available comparable attributes
+        total_weight = 0.0
+        weighted_score = 0.0
+
+        if source_config.max_spatial_distance_meters > 0 and weight_config.spatial > 0:
+            weighted_score += spatial_score * weight_config.spatial
+            total_weight += weight_config.spatial
+
+        if weight_config.name > 0:
+            weighted_score += name_score * weight_config.name
+            total_weight += weight_config.name
+
+        if weight_config.industry > 0:
+            if osm_record.normalized_industry_type and government_record.normalized_industry_type:
+                weighted_score += industry_score * weight_config.industry
+                total_weight += weight_config.industry
+
+        if weight_config.address > 0:
+            if osm_record.normalized_address and government_record.normalized_address:
+                weighted_score += address_score * weight_config.address
+                total_weight += weight_config.address
+
+        match_score = (weighted_score / total_weight) if total_weight > 0 else 0.0
+        match_confidence = classify_match_confidence(match_score, threshold_config)
+        review_required = match_confidence == "uncertain_review"
+        # Preserve blocking provenance in match_method
+        match_method = "+".join(sorted(set(candidate_reasons))) + f"[blocked:{blocking_tag}]"
+        candidate_id = str(uuid5(NAMESPACE_URL, f"candidate:{osm_record.source_key}|{government_record.source_key}"))
+
+        candidates.append(
+            CandidateMatch(
+                candidate_id=candidate_id,
+                osm_source_key=osm_record.source_key,
+                government_source_key=government_record.source_key,
+                osm_id=int(osm_record.source_id),
+                government_source_id=government_record.source_id,
+                government_table=government_record.source_table,
+                spatial_distance_meters=distance_meters,
+                name_score=name_score,
+                industry_score=industry_score,
+                address_score=address_score,
+                match_score=match_score,
+                match_confidence=match_confidence,
+                match_method=match_method,
+                review_required=review_required,
+                matched_source_ids={"osm": [osm_record.source_key], "government": [government_record.source_key], "all": [osm_record.source_key, government_record.source_key]},
+                state_consistent=state_consistent,
+                district_consistent=district_consistent,
+                extraction_date=current_extraction_date(),
             )
-            if source_config.require_state_district_consistency and (not state_consistent or not district_consistent):
-                continue
-
-            distance_meters = _distance_meters(osm_record.geometry, government_record.geometry, metric_crs)
-            name_score = _text_similarity(osm_record.normalized_name, government_record.normalized_name)
-            address_score = _text_similarity(osm_record.normalized_address, government_record.normalized_address)
-            industry_score = _text_similarity(osm_record.normalized_industry_type, government_record.normalized_industry_type)
-
-            candidate_reasons = []
-            if distance_meters <= source_config.max_spatial_distance_meters:
-                candidate_reasons.append("spatial")
-            if name_score >= (source_config.candidate_name_similarity_min / 100.0):
-                candidate_reasons.append("name")
-            if address_score >= (source_config.candidate_address_similarity_min / 100.0):
-                candidate_reasons.append("address")
-            if industry_score >= (source_config.candidate_industry_similarity_min / 100.0):
-                candidate_reasons.append("industry")
-
-            if not candidate_reasons:
-                continue
-
-            spatial_score = 0.0
-            if source_config.max_spatial_distance_meters > 0:
-                spatial_score = max(0.0, 1.0 - min(distance_meters / source_config.max_spatial_distance_meters, 1.0))
-
-            match_score = (
-                spatial_score * weight_config.spatial
-                + name_score * weight_config.name
-                + industry_score * weight_config.industry
-                + address_score * weight_config.address
-            )
-            match_confidence = classify_match_confidence(match_score, threshold_config)
-            review_required = match_confidence == "uncertain_review"
-            match_method = "+".join(sorted(set(candidate_reasons)))
-            candidate_id = str(uuid5(NAMESPACE_URL, f"candidate:{osm_record.source_key}|{government_record.source_key}"))
-
-            candidates.append(
-                CandidateMatch(
-                    candidate_id=candidate_id,
-                    osm_source_key=osm_record.source_key,
-                    government_source_key=government_record.source_key,
-                    osm_id=int(osm_record.source_id),
-                    government_source_id=government_record.source_id,
-                    government_table=government_record.source_table,
-                    spatial_distance_meters=distance_meters,
-                    name_score=name_score,
-                    industry_score=industry_score,
-                    address_score=address_score,
-                    match_score=match_score,
-                    match_confidence=match_confidence,
-                    match_method=match_method,
-                    review_required=review_required,
-                    matched_source_ids={"osm": [osm_record.source_key], "government": [government_record.source_key], "all": [osm_record.source_key, government_record.source_key]},
-                    state_consistent=state_consistent,
-                    district_consistent=district_consistent,
-                    extraction_date=current_extraction_date(),
-                )
-            )
+        )
 
     return candidates
+
 
 
 def classify_match_confidence(match_score: float, threshold_config: MatchingThresholdConfig) -> str:
@@ -337,9 +448,13 @@ def _cluster_scores(records: list[IndustrialRecord], candidate_matches: list[Can
     return 1.0, 1.0, "singleton"
 
 
-def _stable_site_id(records: list[IndustrialRecord]) -> str:
-    canonical = "|".join(sorted(_source_record_key(record) for record in records))
-    return str(uuid5(NAMESPACE_URL, f"industrial-site:{canonical}"))
+def _stable_site_id(records: list[IndustrialRecord], identity_index: Any | None = None) -> str:
+    try:
+        from src.matching.site_identity import resolve_site_id
+        return resolve_site_id(records, identity_index)
+    except Exception:
+        canonical = "|".join(sorted(_source_record_key(record) for record in records))
+        return str(uuid5(NAMESPACE_URL, f"industrial-site:{canonical}"))
 
 
 def _cluster_records(records: list[IndustrialRecord], candidate_matches: list[CandidateMatch]) -> list[list[IndustrialRecord]]:
@@ -374,6 +489,8 @@ def build_master_sites(
     source_config: MatchingSourceConfig,
     weight_config: MatchingWeightConfig,
     threshold_config: MatchingThresholdConfig,
+    *,
+    identity_index: Any | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     records = normalize_source_records(osm_gdf, government_gdf, government_table_name)
     osm_records = [record for record in records if record.source_type == "osm"]
@@ -383,7 +500,7 @@ def build_master_sites(
     clusters = _cluster_records(records, candidate_matches)
     site_id_by_record_key: dict[str, str] = {}
     for cluster in clusters:
-        cluster_site_id = _stable_site_id(cluster)
+        cluster_site_id = _stable_site_id(cluster, identity_index)
         for record in cluster:
             site_id_by_record_key[record.source_key] = cluster_site_id
 
@@ -428,6 +545,7 @@ def build_master_sites(
                 "name": _pick_most_common_text(names),
                 "normalized_name": _pick_most_common_text(normalized_names),
                 "industry_type": _pick_most_common_text(industry_types),
+                "normalized_industry_type": _pick_most_common_text(record.normalized_industry_type for record in cluster),
                 "geometry": geometry,
                 "state": _pick_most_common_text(states),
                 "district": _pick_most_common_text(districts),

@@ -40,3 +40,14 @@ CREATE INDEX IF NOT EXISTS idx_industrial_sites_review_required ON industrial_si
 
 CREATE INDEX IF NOT EXISTS idx_industrial_entity_matches_extraction_date ON industrial_entity_matches (extraction_date);
 CREATE INDEX IF NOT EXISTS idx_osm_industries_extraction_date ON osm_industries (extraction_date);
+
+-- site_source_records indexes (Phase 9)
+CREATE INDEX IF NOT EXISTS idx_ssr_site_id ON site_source_records (site_id);
+CREATE INDEX IF NOT EXISTS idx_ssr_source_key ON site_source_records (source_key);
+CREATE INDEX IF NOT EXISTS idx_ssr_source_system ON site_source_records (source_system);
+CREATE INDEX IF NOT EXISTS idx_ssr_source_id ON site_source_records (source_id);
+
+-- normalized_industry_type index on industrial_sites (Phase 10)
+CREATE INDEX IF NOT EXISTS idx_industrial_sites_normalized_industry_type
+    ON industrial_sites (normalized_industry_type);
+

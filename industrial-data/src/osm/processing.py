@@ -10,6 +10,8 @@ import pandas as pd
 from pyproj import CRS
 from rapidfuzz import fuzz
 from shapely.geometry import MultiPoint
+from shapely.strtree import STRtree
+
 
 from src.osm.tags import normalize_free_text, normalize_industrial_type, normalize_raw_tags
 from src.temporal import current_extraction_date
@@ -156,6 +158,23 @@ def _flag_probable_duplicates(
     probable_duplicate_name_similarity: int,
     probable_duplicate_industry_similarity: int,
 ) -> int:
+    """Flag probable duplicate OSM features using STRtree spatial index.
+
+    Replaces the previous O(N²) nested loop with an O(N log N) approach:
+    1. Project to metric CRS once.
+    2. Build an STRtree on projected geometries.
+    3. For each feature, query only neighbours within the proximity buffer.
+    4. Score name and industry similarity only on that small candidate set.
+
+    A pair is a probable duplicate only when ALL three conditions hold:
+      - distance ≤ probable_duplicate_distance_meters
+      - name similarity ≥ probable_duplicate_name_similarity
+      - industry type similarity ≥ probable_duplicate_industry_similarity
+         (or both types are None/equal strings)
+
+    Records are flagged in-place (``probable_duplicate`` and
+    ``duplicate_group_id`` columns).
+    """
     if gdf.empty:
         return 0
 
@@ -165,46 +184,81 @@ def _flag_probable_duplicates(
         gdf.loc[:, "duplicate_group_id"] = [str(uuid4())]
         return 0
 
+    # --- 1. Project to metric CRS ---
     metric_crs = gdf.estimate_utm_crs() or CRS.from_epsg(3857)
     projected = gdf.to_crs(metric_crs)
-    assigned_groups: dict[int, str] = {}
+    proj_geoms = projected.geometry.values
+
+    # --- 2. Build STRtree ---
+    tree = STRtree(proj_geoms)
+
+    # --- 3. Union-Find for cluster assignment ---
+    parent = list(range(len(gdf)))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # --- 4. Candidate query + scoring ---
+    for i in range(len(gdf)):
+        geom_i = proj_geoms[i]
+        buffered = geom_i.buffer(probable_duplicate_distance_meters)
+        candidates = [int(j) for j in tree.query(buffered, predicate="intersects") if int(j) > i]
+
+        name_i = gdf.at[i, "normalized_name"] or ""
+        ind_i = gdf.at[i, "normalized_industrial_type"] or ""
+
+        for j in candidates:
+            name_j = gdf.at[j, "normalized_name"] or ""
+            ind_j = gdf.at[j, "normalized_industrial_type"] or ""
+
+            # Industry must be compatible (same normalized type or both empty)
+            if ind_i and ind_j and ind_i != ind_j:
+                ind_score = fuzz.ratio(ind_i, ind_j)
+                if ind_score < probable_duplicate_industry_similarity:
+                    continue
+            elif (ind_i or ind_j) and not (ind_i and ind_j):
+                # One has a type, other doesn't — not enough signal to merge
+                continue
+
+            name_score = fuzz.ratio(name_i, name_j)
+            if name_score < probable_duplicate_name_similarity:
+                continue
+
+            dist = float(proj_geoms[i].distance(proj_geoms[j]))
+            if dist > probable_duplicate_distance_meters:
+                continue
+
+            _union(i, j)
+
+    # --- 5. Assign group IDs and flag ---
+    group_id_map: dict[int, str] = {}
+    cluster_sizes: dict[int, int] = defaultdict(int)
+    for i in range(len(gdf)):
+        root = _find(i)
+        cluster_sizes[root] += 1
+
     probable_duplicate_count = 0
+    for i in range(len(gdf)):
+        root = _find(i)
+        if root not in group_id_map:
+            group_id_map[root] = str(uuid4())
+        gdf.at[i, "duplicate_group_id"] = group_id_map[root]
 
-    for index, row in gdf.iterrows():
-        if index in assigned_groups:
-            continue
-
-        group_id = str(uuid4())
-        assigned_groups[index] = group_id
-        cluster_indices = [index]
-
-        for other_index, other_row in gdf.loc[index + 1 :].iterrows():
-            if other_index in assigned_groups:
-                continue
-
-            if row["normalized_industrial_type"] != other_row["normalized_industrial_type"]:
-                continue
-
-            name_score = fuzz.ratio(row["normalized_name"] or "", other_row["normalized_name"] or "")
-            industry_score = fuzz.ratio(row["normalized_industrial_type"] or "", other_row["normalized_industrial_type"] or "")
-            distance_meters = float(projected.loc[index].geometry.distance(projected.loc[other_index].geometry))
-
-            if (
-                distance_meters <= probable_duplicate_distance_meters
-                and name_score >= probable_duplicate_name_similarity
-                and industry_score >= probable_duplicate_industry_similarity
-            ):
-                assigned_groups[other_index] = group_id
-                cluster_indices.append(other_index)
-
-        if len(cluster_indices) > 1:
-            probable_duplicate_count += len(cluster_indices)
-            gdf.loc[cluster_indices, "probable_duplicate"] = True
-            gdf.loc[cluster_indices, "duplicate_group_id"] = group_id
-        else:
-            gdf.loc[index, "duplicate_group_id"] = group_id
+        if cluster_sizes[root] > 1:
+            gdf.at[i, "probable_duplicate"] = True
+            probable_duplicate_count += 1
 
     return probable_duplicate_count
+
+
 
 
 def overpass_gdf_from_response(payload: dict[str, Any]) -> gpd.GeoDataFrame:

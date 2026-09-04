@@ -11,6 +11,19 @@ from sqlalchemy.engine import Engine
 
 from src.temporal import merge_temporal_snapshots
 
+_SOURCE_RECORDS_UPSERT = """
+    INSERT INTO site_source_records
+        (site_id, source_system, source_key, source_id, source_table,
+         source_version, first_linked, last_linked, created_at, updated_at)
+    VALUES
+        (:site_id, :source_system, :source_key, :source_id, :source_table,
+         :source_version, :first_linked, :last_linked, :created_at, :updated_at)
+    ON CONFLICT (site_id, source_system, source_key) DO UPDATE SET
+        source_version = EXCLUDED.source_version,
+        last_linked    = EXCLUDED.last_linked,
+        updated_at     = EXCLUDED.updated_at
+"""
+
 
 def _table_name_is_safe(table_name: str) -> bool:
     return table_name.replace("_", "").isalnum()
@@ -29,6 +42,7 @@ def ensure_matching_tables(engine: Engine, master_table: str, match_table: str) 
         Column("name", Text),
         Column("normalized_name", Text),
         Column("industry_type", Text),
+        Column("normalized_industry_type", Text),
         Column("geometry", Geometry("GEOMETRY", srid=4326), nullable=False),
         Column("state", Text),
         Column("district", Text),
@@ -110,6 +124,16 @@ def write_match_results(engine: Engine, match_table: str, matches_gdf: gpd.GeoDa
 
 
 def write_master_sites(engine: Engine, master_table: str, master_gdf: gpd.GeoDataFrame) -> None:
+    """Write (upsert) master sites into ``master_table``.
+
+    Uses ``merge_temporal_snapshots`` keyed on ``site_id`` so that:
+    - existing rows are **updated** (not replaced) when the same site appears
+      on a refresh run — stable foreign keys are preserved.
+    - ``first_seen`` is never rolled forward.
+    - ``last_seen`` / ``updated_at`` advance to the latest value.
+    - JSONB arrays (osm_ids, government_ids, matched_source_ids) are merged,
+      not overwritten.
+    """
     if master_gdf.empty:
         return
     ensure_matching_tables(engine, master_table=master_table, match_table="industrial_entity_matches")
@@ -124,3 +148,18 @@ def write_master_sites(engine: Engine, master_table: str, master_gdf: gpd.GeoDat
     with engine.begin() as connection:
         connection.execute(text(f'DELETE FROM "{master_table}"'))
     merged.to_postgis(master_table, engine, if_exists="append", index=False)
+
+
+def write_site_source_records(engine: Engine, source_records_df: pd.DataFrame) -> None:
+    """Upsert rows into ``site_source_records`` (the stable identity ledger).
+
+    Uses ON CONFLICT DO UPDATE so:
+    - ``first_linked`` is never overwritten (kept from first appearance).
+    - ``last_linked`` and ``source_version`` advance on each refresh.
+    """
+    if source_records_df.empty:
+        return
+    rows = source_records_df.to_dict(orient="records")
+    with engine.begin() as connection:
+        for row in rows:
+            connection.execute(text(_SOURCE_RECORDS_UPSERT), row)

@@ -18,6 +18,25 @@ from src.government.schema import DetectedCoordinateColumns, detect_coordinate_c
 from src.temporal import current_extraction_date
 
 
+# Lazy-load cleaning pipeline to avoid circular imports and heavy boot cost
+def _get_taxonomy():
+    """Load the industry taxonomy (cached after first call)."""
+    try:
+        from src.cleaning.industry_taxonomy import load_taxonomy
+        return load_taxonomy()
+    except Exception:
+        return None
+
+
+def _normalize_name(name):
+    """Normalize a facility name, returning None on failure."""
+    try:
+        from src.cleaning.names import normalize_facility_name
+        return normalize_facility_name(name)
+    except Exception:
+        return None
+
+
 def normalize_classification_value(value: Any, *, missing_values: list[str], unknown_values: list[str], not_applicable_values: list[str]) -> Any:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -146,6 +165,7 @@ def clean_government_dataframe(
         output_crs=output_crs,
     )
 
+    taxonomy = _get_taxonomy()
     rows = []
     rejected_rows = 0
     repaired_rows = 0
@@ -172,11 +192,18 @@ def clean_government_dataframe(
         )
         extraction_date = current_extraction_date()
 
+        raw_name = row.get(name_column) if name_column else None
+        raw_industry_type = row.get(industry_type_column) if industry_type_column else None
         rows.append(
             {
                 "source_id": _resolve_source_row_id(row, [source_id_column] if source_id_column else []),
-                "name": row.get(name_column) if name_column else None,
-                "industry_type": row.get(industry_type_column) if industry_type_column else None,
+                # Original values preserved — never overwritten
+                "name": raw_name,
+                "normalized_name": _normalize_name(raw_name),
+                "industry_type": raw_industry_type,
+                "normalized_industry_type": (
+                    taxonomy.classify(raw_industry_type) if taxonomy else None
+                ),
                 "address": row.get(address_column) if address_column else None,
                 "state": row.get(state_column) if state_column else None,
                 "district": row.get(district_column) if district_column else None,

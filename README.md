@@ -14,12 +14,12 @@ across India, built on top of the `industrial-data` geospatial pipeline.
 
 ```
 Remote-sensing-OSM/
-├── industrial-data/          # geospatial data pipeline (Phase 1–8 complete)
+├── industrial-data/          # geospatial data pipeline (Phases 1–13 complete)
 │   ├── docker-compose.yml    # PostGIS 16-3.4 container
 │   ├── sql/                  # schema.sql · indexes.sql · functions.sql
-│   ├── scripts/              # run_boundaries.py · run_osm_district.py
-│   │                         # run_government_ingest.py · run_entity_resolution.py
-│   ├── src/                  # Python pipeline source
+│   ├── run_pipeline.py       # Unified end-to-end pipeline runner
+│   ├── scripts/              # individual stage scripts
+│   ├── src/                  # Python pipeline source (OSM, cleaning, matching, export)
 │   └── requirements.txt
 │
 └── industrial-gis/           # Web GIS application (this milestone)
@@ -380,19 +380,59 @@ Current result: **built in ~1.6 s, 369 kB JS bundle**.
 
 ---
 
-## 9 — Data pipeline (industrial-data)
+---
 
-The `industrial-data` module is a separate, self-contained pipeline that
-produces the `industrial_sites` PostGIS table consumed by this web application.
+## 9 — Data Pipeline (`industrial-data`)
 
-| Phase | What it does | Script |
-|---|---|---|
-| 1 | India / state / district boundary ingestion (GeoBoundaries) | `run_boundaries.py` |
-| 2 | OSM industrial extraction via Overpass API | `run_osm_district.py` |
-| 3 | Government dataset ingestion (tabular CSV) | `run_government_ingest.py` |
-| 4–5 | Entity resolution → master `industrial_sites` table | `run_entity_resolution.py` |
-| 6 | Data-quality report (`exports/data_quality_report.json`) | auto-generated |
-| 7 | Temporal tracking (`first_seen`, `last_seen`, `operational_status`) | merged on rerun |
-| 8 | Spatial helper functions + duplicate-cluster detection | PostGIS functions |
+The `industrial-data` module is an end-to-end, production-grade geospatial data pipeline that populates the PostGIS `industrial_sites` table and generates the final master GeoJSON datasets consumed by the Web GIS application.
 
-See [`industrial-data/README.md`](industrial-data/README.md) for full pipeline documentation.
+### Unified Pipeline Execution
+
+The pipeline is fully orchestrated via a single command:
+
+```powershell
+# Run pipeline for a single state (OSM extraction, cleaning, matching, master generation)
+python run_pipeline.py --state "Uttar Pradesh" --skip-government
+
+# Run with refresh mode (re-extracts Overpass, preserves first_seen history, updates in-place)
+python run_pipeline.py --state "Uttar Pradesh" --refresh --skip-government
+
+# Dry-run mode (runs all processing in-memory without writing to database or disk)
+python run_pipeline.py --state "Uttar Pradesh" --dry-run --skip-government
+
+# With a configured government dataset
+python run_pipeline.py --state "Uttar Pradesh" \
+    --government-csv data/raw/up_industries.csv \
+    --government-name-column "FacilityName" \
+    --government-type-column "IndustryType"
+
+# India-level mode (processes all 36 states and union territories sequentially with checkpoint resume)
+python run_pipeline.py --state ALL --skip-government
+```
+
+### The 8 Pipeline Steps
+
+```
+[1/8] Loading State Boundary      → Loads boundary from PostGIS states table
+[2/8] Loading District Boundaries  → Discovers all intersecting districts (e.g. 75 in UP)
+[3/8] Fetching OSM Industrial Data → District-by-district Overpass API queries with checkpoints & rate-limiting
+[4/8] Loading Government Data      → Dynamic source adapters with schema validation
+[5/8] Cleaning Data                → Cross-district deduplication & taxonomy classification
+[6/8] Matching Records             → Scalable candidate blocking (spatial radius + STRtree)
+[7/8] Creating Master Dataset      → Merges automatic matches & preserves singletons
+[8/8] Saving Results               → PostGIS transactional upsert & GeoJSON export
+```
+
+### Key Engineering Features Implemented
+
+- **District-by-District Extraction**: Scalable Overpass API client that iterates district boundaries with exponential backoff, rate limiting, and `.complete` sentinel checkpoints.
+- **Multipolygon Relation Support**: Reconstructs complex industrial estate polygons from OSM outer/inner member ways using Shapely `polygonize`.
+- **Change Detection & Refresh Diff**: Tracks feature updates using `osm_version`, retains deleted features with `not_seen_on_refresh`, and preserves `first_seen` timestamps.
+- **Reproducible Government Adapters**: Standardized adapter pattern (`src/government/sources/`) with validation error reporting and honest unavailable source handling.
+- **Controlled Industry Taxonomy**: Maps raw strings into standardized industrial codes (`TEXTILE`, `CHEMICAL`, `STEEL_METAL`, `FOOD_PROCESSING`, etc.) via YAML taxonomy.
+- **Scalable Candidate Blocking**: Replaces $O(N \times M)$ brute force matching with spatial radius STRtree blocking, reducing candidate pairs by up to 99%.
+- **Robust Site Identity (Canonical Anchor)**: Derives UUIDs from the single most permanent source key. Adding or matching new records to an existing facility never changes its `site_id`, preventing foreign key drift.
+- **Master Dataset Assembly**: Confirmed matches are clustered into master industrial sites; unmatched records are retained as singletons (`source_count = 1`).
+- **GeoJSON Export & Validation**: Serializes all master sites to `data/processed/<State>/master_industrial_sites.geojson` with strict RFC 7946 validation.
+- **Non-Destructive PostGIS Upsert**: Uses `merge_temporal_snapshots()` to update database records in-place without deleting existing rows.
+
